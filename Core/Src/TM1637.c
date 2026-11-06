@@ -1,277 +1,163 @@
 /*______________In the name of Allah, Most Gracious, Most Merciful______________
-	
+
 	This library is written to allow the STM32 micro-controller to handle TM1637 LED
 	driver using a manual communication protocol (through GPIO pins)
-	
-	Created by 				: Ward Almasarani 
+
+	Created by 				: Ward Almasarani
 	Start Date 				: 2020/09/29
 	file name 				: tm1637.c
 	Version					: 1.0
+
+	Version 2.0 (medidor de tela):
+	- CLK push-pull, DIO open-drain: el TM1637 puede bajar la linea en el ACK
+	  sin chocar con la salida del micro, y se lee el estado real de la linea.
+	- Tiempos fijos con el contador de ciclos DWT (antes dependian de la
+	  velocidad de HAL_GPIO_WritePin y el reloj iba demasiado rapido).
+	- El ACK se verifica sobre DIO con timeout (antes se leia CLK, el bucle
+	  no tenia cuerpo y se reconfiguraba un pin de GPIOD).
 ______________________________________________________________________________*/
+#include "TM1637.h"
 
-#ifndef tm1637
-#include "tm1637.h"
-#include "stm32f1xx_hal_gpio.h"
+#define ACK_TIMEOUT_US		50u
 
-extern uint32_t Timer1;
-extern uint8_t CurrentDisplay[4];
-extern uint8_t tm1637_Segments[8];
-void tm1637_CLKhigh()
-{																	  	//SCL high period
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_SET);		  	//Setting SCL frequency
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_SET);
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_SET);
-}
-void tm1637_CLKlow()
+static void delay_us(uint32_t us)
 {
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_RESET);		//SCL low period
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(SCLK_GPIO_Port, SCLK_Pin, GPIO_PIN_RESET);
-}
-void tm1637_SDOhigh()
-{
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_SET);			//SDO high period
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_SET);
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_SET);
-}
-void tm1637_SDOlow()
-{
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_RESET);			//SDO low period
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(SDO_GPIO_Port, SDO_Pin, GPIO_PIN_RESET);
-}
-void tm1637_StartPacket()												//Lower SDO line while CLK line is high
-{
-	tm1637_CLKhigh();
-
-	tm1637_SDOhigh();
-	tm1637_SDOlow();
-
-	tm1637_CLKlow();
-}
-void tm1637_EndPacket()													//SDO line is pulled high while SCL line is high
-{
-	tm1637_CLKlow();
-	tm1637_SDOlow();
-
-	tm1637_CLKhigh();
-	tm1637_SDOhigh();
-}
-void tm1637_DataOut(uint8_t *tm1637_TxBuffer)							//Low level data transfer function
-{
-
-	for(int8_t j = 0; j < PACKET_SIZE; j++)								//Send least significant bit first
+	uint32_t inicio = DWT->CYCCNT;
+	uint32_t ciclos = us * (SystemCoreClock / 1000000u);
+	while ((DWT->CYCCNT - inicio) < ciclos)
 	{
-		tm1637_CLKlow();
-		if(tm1637_TxBuffer[j] == GPIO_PIN_SET)							//Check logic level
-		{
-			tm1637_SDOhigh();
-
-		}
-		else
-		{
-			tm1637_SDOlow();
-
-		}
-		tm1637_CLKhigh();
-	} 
+	}
 }
-void tm1637_TxCommand(uint8_t *Command)
-{																		//Handles high level (bit by bit) transmission operation
-	uint8_t ByteData[8] = {0};
 
-	for(uint8_t i = 0; i < PACKET_SIZE; i++)
+static inline void clk(int nivel)
+{
+	HAL_GPIO_WritePin(TM1637_CLK_PORT, TM1637_CLK_PIN, nivel ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static inline void dio(int nivel)		/* 1 = liberar (pull-up), 0 = bajar */
+{
+	HAL_GPIO_WritePin(TM1637_DIO_PORT, TM1637_DIO_PIN, nivel ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static inline int dio_leer(void)
+{
+	return HAL_GPIO_ReadPin(TM1637_DIO_PORT, TM1637_DIO_PIN) == GPIO_PIN_SET;
+}
+
+static void inicio_trama(void)			/* DIO baja con CLK en alto */
+{
+	dio(1);
+	clk(1);
+	delay_us(TM1637_SEMICICLO_US);
+	dio(0);
+	delay_us(TM1637_SEMICICLO_US);
+	clk(0);
+	delay_us(TM1637_SEMICICLO_US);
+}
+
+static void fin_trama(void)				/* DIO sube con CLK en alto */
+{
+	clk(0);
+	dio(0);
+	delay_us(TM1637_SEMICICLO_US);
+	clk(1);
+	delay_us(TM1637_SEMICICLO_US);
+	dio(1);
+	delay_us(TM1637_SEMICICLO_US);
+}
+
+/* Envia un byte (LSB primero). Devuelve 1 si el TM1637 respondio con ACK. */
+static int escribir_byte(uint8_t b)
+{
+	for (uint8_t i = 0; i < 8u; i++)
 	{
-
-		ByteData[i] = (Command[0] & (0x01 << i)) && 1;
-
-																		//Convert from byte to bit per array element
+		clk(0);
+		dio(b & 0x01u);
+		b >>= 1;
+		delay_us(TM1637_SEMICICLO_US);
+		clk(1);
+		delay_us(TM1637_SEMICICLO_US);
 	}
 
-	tm1637_StartPacket();												//Send start packet bit
-	tm1637_DataOut(ByteData);											//Send one byte
-	tm1637_CLKlow();													//Send one CLK for acknowledgment
-	tm1637_CLKhigh();
-	tm1637_ACKcheck();													//wait for acknowledgment.
-	if((Command[0] & 0xC0) != (0xC0))										//Check if the received packet is not an address.
+	/* 9no pulso: el TM1637 baja DIO como ACK */
+	clk(0);
+	dio(1);
+	uint32_t espera = 0;
+	while (dio_leer() && espera < ACK_TIMEOUT_US)
 	{
-		tm1637_EndPacket();
+		delay_us(1);
+		espera++;
 	}
-
+	int ack = !dio_leer();
+	clk(1);
+	delay_us(TM1637_SEMICICLO_US);
+	clk(0);
+	delay_us(TM1637_SEMICICLO_US);
+	return ack;
 }
-void tm1637_TxData(uint8_t *Data, uint8_t PacketSize)
-{																		//Handles high level (bit by bit) transmission operation
-	uint8_t ByteData[8] = {0};
 
-	for(uint8_t i = 0; i < PacketSize; i++)
+void tm1637_Init(void)
+{
+	GPIO_InitTypeDef gpio = {0};
+
+	/* Contador de ciclos para los retardos */
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+	HAL_GPIO_WritePin(TM1637_CLK_PORT, TM1637_CLK_PIN, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(TM1637_DIO_PORT, TM1637_DIO_PIN, GPIO_PIN_SET);
+
+	gpio.Pin = TM1637_CLK_PIN;
+	gpio.Mode = GPIO_MODE_OUTPUT_PP;
+	gpio.Pull = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(TM1637_CLK_PORT, &gpio);
+
+	gpio.Pin = TM1637_DIO_PIN;
+	gpio.Mode = GPIO_MODE_OUTPUT_OD;		/* el modulo trae pull-up */
+	HAL_GPIO_Init(TM1637_DIO_PORT, &gpio);
+}
+
+static int comando(uint8_t cmd)
+{
+	inicio_trama();
+	int ok = escribir_byte(cmd);
+	fin_trama();
+	return ok;
+}
+
+tm1637_StatusTypedef tm1637_DisplayHandle(uint8_t Brightness, const uint8_t *DisplayBuffer)
+{
+	if (Brightness > 7u)
 	{
-		for(uint8_t j = 0; j < 8; j++)
-		{
-			ByteData[j] = (Data[i] & (0x01 << j)) && 1;
-		}
-		tm1637_DataOut(ByteData);
-		tm1637_CLKlow();
-		tm1637_CLKhigh();
-		tm1637_ACKcheck();												//Transmit byte by byte
-
+		return TM1637_ERROR;
 	}
-	tm1637_EndPacket();													//Send end packet at the end of data transmission.
 
+	int ok = comando(DATA_SET);
 
-}
-void tm1637_Initialize(uint8_t Direction)								//Since SDI line is doing both transmission and reception
-{																		//the corresponding GPIO pin must be reinitialized on the run
-	GPIO_InitTypeDef GPIO_InitStruct = {0};								//To read ACK from TM1637 and to write data to it
-	GPIO_InitStruct.Pin = SCLK_Pin;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	switch (Direction)													//Depending on the function input initialize the pin as input or output
+	inicio_trama();
+	ok &= escribir_byte(C0H);
+	for (uint8_t i = 0; i < 4u; i++)
 	{
-		case DISPLAY2STM:
-			GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-			HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-			break;
-		case STM2DISPLAY:
-			GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-			HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-			break;
-
+		ok &= escribir_byte(DisplayBuffer[i]);
 	}
+	fin_trama();
 
+	ok &= comando((uint8_t)(DISPLAY_ON | Brightness));
+
+	return ok ? TM1637_OK : TM1637_ERROR;
 }
-void tm1637_ACKcheck()
+
+tm1637_StatusTypedef tm1637_DisplayClear(void)
 {
-	//Wait for acknowledgment bit
-	tm1637_Initialize(DISPLAY2STM);										//initialize pin as input
-	tm1637_CLKlow();													//lower CLK line
-	while(HAL_GPIO_ReadPin(SCLK_GPIO_Port, SCLK_Pin))					//Wait until ACK bit is received
-	tm1637_Initialize(STM2DISPLAY);										//initialize pin as output for data transfer
-}
-void tm1637_DisplayClear()
-{
-	uint8_t EmptyBuffer[4] = {0};
-	uint8_t CommandCarrier[1] = {0};
-	CommandCarrier[0] = DATA_SET;									//Send set data command
-	tm1637_TxCommand(CommandCarrier);
-	CommandCarrier[0] = C0H;										//Set address
-	tm1637_TxCommand(CommandCarrier);
-	tm1637_TxData(EmptyBuffer, 4);
-	CommandCarrier[0] = DISPLAY_OFF;
-	tm1637_TxCommand(CommandCarrier);
-}
-uint8_t tm1637_DisplayHandle(uint8_t Brightness, uint8_t *DisplayBuffer)
-{
-	//This function handles the low level protocol used to set data address of TM1637 and turn the display on
-	//#param Brightness is used to set the brightness level of the display. This function accepts Brightness value between 0 and 7
-	//#param *DisplayBuffer is the buffer used to map data from the RAM to the display each element corresponds to one segment in the display
-	uint8_t CommandCarrier[1] = {0};
-	tm1637_StatusTypedef ParameterFalidation = TM1637_ERROR;
-	if(Brightness <= 7)												//there are 7 levels of brightness
+	static const uint8_t vacio[4] = {0};
+	tm1637_StatusTypedef st = tm1637_DisplayHandle(0, vacio);
+	if (!comando(DISPLAY_OFF))
 	{
-	  CommandCarrier[0] = DATA_SET;									//Send set data command
-	  tm1637_TxCommand(CommandCarrier);
-	  CommandCarrier[0] = C0H;										//Set address
-	  tm1637_TxCommand(CommandCarrier);
-
-	  tm1637_TxData(DisplayBuffer, 4);								//Map the data stored in RAM to the display
-	  tm1637_SetBrighness(Brightness);								//Turn on display and set brightness
-		ParameterFalidation = TM1637_OK;
-		return ParameterFalidation;
+		st = TM1637_ERROR;
 	}
-	return ParameterFalidation;
-}
-tm1637_StatusTypedef tm1637_SetBrighness(uint8_t BrighnessLevel)
-{
-	uint8_t BrighnessBuffer[8] = {0};
-	tm1637_StatusTypedef ParameterFalidation = TM1637_ERROR;
-	if(BrighnessLevel <= 7)												//there are 7 levels of brightness
-	{																	//Any value above that will be ignored.
-		BrighnessLevel = BrighnessLevel | DISPLAY_ON;					//Set Brightness level with display on command
-
-		for(uint8_t i = 0; i < 8; i++)
-		{
-			BrighnessBuffer[i] = (BrighnessLevel & (0x01 << i)) && 1;
-		}
-		tm1637_StartPacket();
-		tm1637_DataOut(BrighnessBuffer);
-		tm1637_CLKlow();													//Send one CLK for acknowledgment
-		tm1637_CLKhigh();
-		tm1637_ACKcheck();													//wait for acknowledgment.
-		tm1637_EndPacket();
-		ParameterFalidation = TM1637_OK;
-		return ParameterFalidation;
-	}
-	return ParameterFalidation;
-}
-void tm1637_Effect(uint8_t Rotationfrequency)
-{
-	  static uint8_t SegmentTracker = 0;
-	  static uint8_t SegmentPointer = 0;
-	  if(Timer1 >= 150)
-	  {
-		  Timer1 = 0;
-		  if(SegmentTracker < 4)
-		  {
-			  CurrentDisplay[0] = 0;
-			  CurrentDisplay[1] = 0;
-			  CurrentDisplay[2] = 0;
-			  CurrentDisplay[3] = tm1637_Segments[SegmentPointer];
-			  if(SegmentPointer != 3)
-			  {
-				  SegmentPointer ++;									//Prevent extra incrementing
-			  }
-		  }
-		  else if((SegmentTracker > 5) && (SegmentTracker < 10))
-		  {
-			  if(SegmentPointer == 6)
-			  {
-				  SegmentPointer = 0;
-			  }
-			  CurrentDisplay[0] = tm1637_Segments[SegmentPointer];
-			  CurrentDisplay[1] = 0;
-			  CurrentDisplay[2] = 0;
-			  CurrentDisplay[3] = 0;
-
-			  SegmentPointer ++;
-		  }
-		  else if(SegmentTracker == 4)
-		  {
-			  CurrentDisplay[0] = 0;
-			  CurrentDisplay[1] = 0;
-			  CurrentDisplay[2] = tm1637_Segments[SegmentPointer];
-			  CurrentDisplay[3] = 0;
-		  }
-		  else if(SegmentTracker == 5)
-		  {
-			  CurrentDisplay[0] = 0;
-			  CurrentDisplay[1] = tm1637_Segments[SegmentPointer];
-			  CurrentDisplay[2] = 0;
-			  CurrentDisplay[3] = 0;
-		  }
-		  else if(SegmentTracker == 10)
-		  {
-			  SegmentPointer = 0;
-			  CurrentDisplay[0] = 0;
-			  CurrentDisplay[1] = tm1637_Segments[SegmentPointer];
-			  CurrentDisplay[2] = 0;
-			  CurrentDisplay[3] = 0;
-		  }
-		  else if(SegmentTracker == 11)
-		  {
-			  CurrentDisplay[0] = 0;
-			  CurrentDisplay[1] = 0;
-			  CurrentDisplay[2] = tm1637_Segments[SegmentPointer];
-			  CurrentDisplay[3] = 0;
-		  }
-		  tm1637_DisplayHandle(7, CurrentDisplay);
-		  SegmentTracker++;
-		  if(SegmentTracker > 11)										//Once 12 steps are completed reset all trackers.
-		  {
-			  SegmentPointer = 0;
-			  SegmentTracker = 0;
-		  }
-
-	  }
+	return st;
 }
 
 uint8_t char2segments(char c) {
@@ -346,4 +232,3 @@ uint8_t char2segments(char c) {
         }
         return 0;
     }
-#endif
