@@ -15,10 +15,27 @@ Medidor de tela con encoder rotativo de cuadratura, STM32F103C8 ("Blue Pill") y 
 | UART TX / RX | PA9 / PA10 | 9600 8N1 |
 | LED | PC13 | Parpadea cada 250 ms (indica que el programa está vivo) |
 
-> **Importante:** PA6/PA7 no toleran 5 V. Si el encoder trabaja a 5–24 V (por ejemplo, NPN de colector abierto
-> con pull-up a la alimentación), hay que adaptar el nivel: pull-up a 3,3 V en el lado del micro, divisor
-> resistivo u optoacoplador. Con cables largos conviene usar un cable mallado con la malla a GND, y un
-> capacitor de 1–10 nF a GND en cada entrada.
+### Encoder LPD3806-360BM
+
+Es un encoder de 360 PPR con salidas **NPN de colector abierto**: solo baja la línea a GND y nunca entrega
+tensión. Sin pull-up, las entradas quedan flotando y captan ruido. Se alimenta con 5–24 V.
+
+| Cable | Conexión |
+|---|---|
+| Rojo | +5 V (o hasta 24 V) |
+| Negro | GND (común con la Blue Pill) |
+| Verde (A) | PA6 + resistencia de **2,2 kΩ a 3,3 V** |
+| Blanco (B) | PA7 + resistencia de **2,2 kΩ a 3,3 V** |
+| Malla | GND, solo del lado de la placa |
+
+* Las resistencias de pull-up van a **3,3 V, nunca a 5 V ni a la alimentación del encoder**: PA6/PA7 no
+  toleran 5 V. Como la salida es de colector abierto, el encoder puede alimentarse con 5–24 V sin problema.
+* El pull-up interno del micro (~40 kΩ) alcanza para pruebas en la mesa, pero con cable largo y motores
+  cerca es muy débil. Con 1–4,7 kΩ externos el flanco de subida es más rápido y la entrada es mucho más
+  inmune al ruido.
+* Opcional: un capacitor de 1 nF de cada entrada a GND, cerca del micro.
+* 360 PPR × 4 flancos = 1440 pulsos/vuelta (`ENC_PULSOS_POR_VUELTA`). El encoder admite hasta 20 kHz por
+  canal; con la rueda de 21,19 cm eso equivale a unos 700 m/min.
 
 ## Funcionamiento
 
